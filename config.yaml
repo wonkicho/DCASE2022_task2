@@ -1,0 +1,32 @@
+dev_directory: D:/dev_data2
+eval_directory: ../eval_data
+model_directory: ./model
+result_directory: ./result
+result_file: result.csv
+
+max_fpr: 0.1
+decision_threshold: 0.9
+
+feature:
+  n_mels: 128
+  n_frames: 64
+  n_hop_frames: 8
+  n_fft: 1024
+  hop_length: 512
+  power: 2.0
+  sr: 16000
+
+fit:
+  lr: 0.00001
+  epochs: 1
+  batch_size: 16
+  shuffle: True
+  validation_split: 0.2
+  verbose: 1
+  weight_decay: 0.0001
+  lr_step_size: 50
+  lr_gamma: 0.5
+
+arcface:
+  m: 0.7
+  s: 30
