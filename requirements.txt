@@ -1,0 +1,10 @@
+matplotlib==3.5.1
+numpy==1.21.5
+PyYAML==6.0
+scikit-learn==1.0.2
+scipy
+librosa==0.9.1
+audioread==2.1.9
+setuptools==60.9.3
+tqdm==4.63.0
+pandas

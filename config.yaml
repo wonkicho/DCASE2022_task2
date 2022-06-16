@@ -1,11 +1,16 @@
-dev_directory: D:/dev_data2
+dev_directory: ../dev_data2
 eval_directory: ../eval_data
-model_directory: ./model
-result_directory: ./result
+model_directory: ./model_STGRAM_MFN_label_condition4/
+result_directory: ./result_MFN_label_condition4/train
 result_file: result.csv
 
 max_fpr: 0.1
 decision_threshold: 0.9
+
+wandb:
+ project: DCASE-Anomaly_Detection
+
+ 
 
 feature:
   n_mels: 128
@@ -13,20 +18,22 @@ feature:
   n_hop_frames: 8
   n_fft: 1024
   hop_length: 512
+  win_length: 1024
   power: 2.0
   sr: 16000
 
 fit:
-  lr: 0.00001
-  epochs: 1
-  batch_size: 16
+  lr: 0.00005
+  epochs: 200
+  batch_size: 64
   shuffle: True
   validation_split: 0.2
   verbose: 1
-  weight_decay: 0.0001
-  lr_step_size: 50
-  lr_gamma: 0.5
+  weight_decay: 0.001
+  n_accumulate: 1
+  mixup: 1
+
 
 arcface:
-  m: 0.7
+  m: 0.5
   s: 30

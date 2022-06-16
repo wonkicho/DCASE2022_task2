@@ -1,13 +1,16 @@
 from torch import nn
+import timm
 import torch
 import torch.nn.functional as F
 import math
 import librosa
 import os
 from torch.nn import Parameter
+from torchsummary import summary
+from utils import *
 
-os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+# os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 Mobilefacenet_bottleneck_setting = [
     # t, c , n ,s
@@ -58,9 +61,10 @@ class ArcMarginProduct(nn.Module):
         else:
             phi = torch.where((cosine - self.th) > 0, phi, cosine - self.mm)
 
-        one_hot = torch.zeros(cosine.size()).to(x.device)
+        #one_hot = torch.zeros(cosine.size()).to(x.device)
         #print(x.device, label.device, one_hot.device)
-        one_hot.scatter_(1, label.view(-1, 1).long(), 1)
+        #one_hot.scatter_(1, label.view(-1, 1).long(), 1)
+        one_hot = label.long()
         output = (one_hot * phi) + ((1.0 - one_hot) * cosine)
         output = output * self.s
         return output
@@ -133,9 +137,9 @@ class MobileFaceNet(nn.Module):
         self.conv2 = ConvBlock(bottleneck_setting[-1][1], 512, 1, 1, 0)
 
         self.linear7 = ConvBlock(512, 512, (8, 20), 1, 0, dw=True, linear=True)
-
+        #(8, 27)
         self.linear1 = ConvBlock(512, 128, 1, 1, 0, linear=True)
-
+        
         self.fc_out = nn.Linear(128, num_class)
         self.arcface = arcface
         # init
@@ -172,6 +176,46 @@ class MobileFaceNet(nn.Module):
         else:
             out = self.fc_out(feature)
         return out, feature
+
+class CustomClassifier(nn.Module):
+    def __init__(self, model_arch, n_class, pretrained=False, arcface=None):
+        super().__init__()
+        self.model = timm.create_model(model_arch, pretrained=pretrained)
+        self.model.conv_stem = nn.Conv2d(2, 16, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+        self.in_features = self.model.classifier.in_features
+        self.bn1 = nn.BatchNorm2d(self.in_features)
+        self.dropout = nn.Dropout2d(0.2, inplace=True)
+        self.fc1 = nn.Linear(self.in_features , 512)
+        self.bn2 = nn.BatchNorm1d(512)
+
+        self.fc2 = nn.Linear(512, 128)
+        self.bn3 = nn.BatchNorm1d(128)
+
+        self.fc_out = nn.Linear(128, n_class) 
+        self.arcface = arcface
+        
+
+        # if self.arcface:
+        #     self.model.classifier = self.arcface(n_features, n_class)
+        # else:
+        #     self.model.classifier = nn.Linear(n_features, n_class)
+        
+    def forward(self, x, label):
+        features = self.model.forward_features(x)
+        features = self.bn1(features)
+        features = self.dropout(features)
+        features = features.view(features.size(0), -1)
+        features = self.fc1(features)
+        features = self.bn2(features)
+        features = self.fc2(features)
+        features = self.bn3(features)
+        #features = F.normalize(features)
+        if self.arcface:
+            return self.arcface(features, label), features
+        else:
+            out = self.fc_out(features)
+            return out, features
+        
     
 class TgramNet(nn.Module):
     def __init__(self, num_layer=3, mel_bins=128, win_len=1024, hop_len=512):
@@ -180,7 +224,7 @@ class TgramNet(nn.Module):
         self.conv_extrctor = nn.Conv1d(1, mel_bins, win_len, hop_len, win_len // 2, bias=False)
         self.conv_encoder = nn.Sequential(
             *[nn.Sequential(
-                nn.LayerNorm(313),
+                nn.LayerNorm(313),#313
                 nn.LeakyReLU(0.2, inplace=True),
                 nn.Conv1d(mel_bins, mel_bins, 3, 1, 1, bias=False)
             ) for _ in range(num_layer)])
@@ -189,7 +233,10 @@ class TgramNet(nn.Module):
         out = self.conv_extrctor(x)
         out = self.conv_encoder(out)
         return out  
-    
+
+
+
+
 class STgramMFN(nn.Module):
     def __init__(self, num_class,
                  c_dim=128,
@@ -203,6 +250,10 @@ class STgramMFN(nn.Module):
         self.mobilefacenet = MobileFaceNet(num_class=num_class,
                                            bottleneck_setting=bottleneck_setting,
                                            arcface=arcface)
+        # self.custom_clf = CustomClassifier(model_arch = "mobilenetv3_small_100",
+        #                                   n_class = num_class, pretrained = True,
+        #                                   arcface = arcface
+        #                                 )
 
         
     def get_tgram(self, x_wav):
@@ -212,17 +263,21 @@ class STgramMFN(nn.Module):
         x_wav = self.tgramnet(x_wav).unsqueeze(1)
         x = torch.cat((x_mel, x_wav), dim=1)
         out, feature = self.mobilefacenet(x, label)
+        #out, feature = self.custom_clf(x, label)
         return out, feature
     
 
 if __name__ == "__main__":
-    file_path = "D:\\dev_data2\\bearing\\train\\section_00_source_train_normal_0000_vel_22.wav"
-    sr = 16000
+    # os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
+    # os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+    yaml_path = "./config.yaml"
+    CONFIG = yaml_load(yaml_path)
+    arcface = ArcMarginProduct(128, 6, m=CONFIG["arcface"]["m"], s=CONFIG["arcface"]["s"])
+    model = STgramMFN(num_class=6,
+                    c_dim=CONFIG["feature"]["n_mels"],
+                    win_len=CONFIG["feature"]["win_length"],
+                    hop_len=CONFIG["feature"]["hop_length"],
+                    arcface=arcface).to(DEVICE)
     
-    x, _ = librosa.core.load(file_path, sr = sr, mono=True)
-    x = x[:sr * 10]
-    x_wav = torch.from_numpy(x).reshape(1, 1, -1) #batch, channel, feature
-    print(x_wav.shape)
-    tgram = TgramNet()
-    output = tgram(x_wav)
-    print(x_wav, len(x_wav[0]))
+    summary(model, [(1, 160000),(1, 128, 313),(0, 6)])
+    

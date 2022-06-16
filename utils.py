@@ -7,18 +7,24 @@ import argparse
 import sys
 import os
 import itertools
+import csv
 import re
 
 # additional
 import sklearn
+import scipy
 import numpy as np
+import torch
+import torchaudio
 import librosa
 import librosa.core
 import librosa.feature
 import yaml
+import joblib
 from tqdm import tqdm
 
 import torch
+from torch.autograd import Variable
 ########################################################################
 
 
@@ -293,6 +299,8 @@ def file_list_generator(target_dir,
     return files, labels
 ########################################################################
 
+
+
 def file_list_to_data(file_list,
                       msg="calc...",
                       n_mels=64,
@@ -364,116 +372,262 @@ def get_dataloader(dataset, CONFIG):
 
     return data_loader_train, data_loader_val, data_loader_eval_train
 
+def save_checkpoint(state, is_best, filename):
+    torch.save(state, filename)
+    if is_best:
+        shutil.copyfile(filename, 'model_best.pth.tar')
+
+def save_model(model, model_dir, machine_type, states):
+    """
+    Save PyTorch model.
+    """
+
+    model_file_path = "{model}/model_{machine_type}.pth".format(
+        model=model_dir, machine_type=machine_type
+    )
+    # if os.path.exists(model_file_path):
+    #     print("Model already exists!")
+    #     continue
+
+    torch.save(model.state_dict(), model_file_path)
+    print("save_model -> %s" % (model_file_path))
+
 #########################################################
 #train
-def training(model, data_loader, criterion ,optimizer, DEVICE, epoch, scheduler=None):
+def training(model, data_loader, criterion ,optimizer, DEVICE, epoch, config ,scheduler=None):
     """
     Perform training
     """
     model.train()  # training mode
     train_loss = 0.0
-    pbar = tqdm(data_loader, total=len(data_loader), ncols=100)
-    for idx, (wav, mel, label) in enumerate(pbar):
+    dataset_size = 0.0
+    pbar = tqdm(enumerate(data_loader), total=len(data_loader), ncols=100)
+    for idx, (wav, mel, label) in pbar:
         wav = wav.float().unsqueeze(1).to(DEVICE)
         mel = mel.float().to(DEVICE)
         label = label.long().to(DEVICE)
-        #label = label.softmax(dim=1)
-        
+    
+        print(wav.shape, mel.shape, label.shape)
+
+        batch_size = wav.size(0)
+
         preds , _= model(wav, mel, label)
-        
-        optimizer.zero_grad()  # reset gradient
-        loss = criterion(preds, label)
-        pbar.set_description(f'Epoch:{epoch}'
-                                     f'\tLclf:{loss.item():.5f}\t')
-        loss.backward()  # backpropagation
-        train_loss += loss.item()
-        optimizer.step()  # update paramerters
+        #loss = criterion(preds, label)
 
-    if scheduler is not None:
-        scheduler.step()  # update learning rate
-
-    correct = 0
-    total = 0
-    y_pred = []
-    y_true = []
-    with torch.no_grad():
-        for wav, mel, label in data_loader:
-            wav = wav.float().unsqueeze(1).to(DEVICE)
-            mel = mel.float().to(DEVICE)
-            label = label.long().to(DEVICE)
-            outputs,features = model(wav, mel, label)
-            probs = - torch.log_softmax(outputs, dim=1).mean(dim=0).squeeze().cpu().numpy()
-            y_pred.append(probs)
-            y_true.append(label.cpu().numpy())
-            #correct += (predicted == label).sum().item()
-            #total += label.size(0)
-    
-    
-    auc = sklearn.metrics.roc_auc_score(y_true, y_pred)
-    print(auc)
-    #accuracy = 100 * float(correct / total)
-    #print(
-    #    "accuracy: {:.6f}% ({}/{})".format(
-    #      accuracy , correct, total
-    #    ),
-    #)
-
-    return train_loss
-
-def validation(model, data_loader, criterion ,DEVICE , CONFIG):
-    """
-    Perform validation
-    """
-    model.eval()  # validation mode
-    val_loss = 0.0
-    correct = 0
-    total = 0
-    y_pred = [0. for _ in len(data_loader)]
-    pbar = tqdm(data_loader, total=len(data_loader), ncols=100)
-    with torch.no_grad():
-        for idx, (wav, mel, label) in enumerate(pbar):
-            wav = wav.float().unsqueeze(1).to(DEVICE)
-            mel = mel.float().to(DEVICE)
-            label = label.long().to(DEVICE)
+        dice = np.random.random() < config["fit"]["mixup"]
+        if dice:
+            wav, mel, label_a, label_b, lam = mixup_data(wav, mel, label, alpha = 0.3)
+            wav, mel, label_a, label_b = map(Variable, (wav, mel, label_a, label_b))
             
-            preds, features = model(wav, mel, label)
+
+        if dice:
+            loss = mixup_criterion(criterion, preds, label_a.float(), label_b.float(), lam)
+        else:
             loss = criterion(preds, label)
-            val_loss += loss.item()
+        
+        loss.backward()  # backpropagation
+        
 
-            _, predicted = torch.max(preds, 1)
-            correct += (predicted == label).sum().item()
-            total += label.size(0)
+        if (idx + 1) % config["fit"]['n_accumulate'] == 0:
+            optimizer.step()  # update paramerters
+            optimizer.zero_grad()  # reset gradient
+
+            if scheduler is not None:
+                scheduler.step()  # update learning rate
+
+        train_loss += (loss.item() * batch_size)
+        dataset_size += batch_size
+        epoch_loss = train_loss / dataset_size
+        pbar.set_description(f'Epoch:{epoch}'
+                                     f'\tLclf:{epoch_loss:.5f}\t')
+
+
+    return epoch_loss
+
+
+def evaluation(model, target_dir, unique_section_names, machine_type, sec, sec_dict, criterion, CONFIG, DEVICE, mode):
+    performance = []
+    performance_recon = []
+    total_loss = 0.0
+    dataset_size = 0.0
+
+    for section_idx, section_name in enumerate(unique_section_names):
+        test_files, y_true = file_list_generator(
+                        target_dir=target_dir,
+                        section_name=section_name,
+                        dir_name="test",
+                        mode=mode,
+                    )
+        dataset_size += len(y_true)
+        #['A1', 'A2', 'E1', 'E2', 'C2', 'C1', '40V', '28V', '31V', '37V', 1, 2]
+        y_pred = [0. for _ in test_files]
+        for file_idx, (file_path, label) in enumerate(zip(test_files,y_true)):
+            fp = os.path.split(file_path)[1]
+            fp = os.path.join(machine_type, "test", fp)
+            label = []
+            for i in range(len(sec)):
+                if i == sec.index(sec_dict[fp]):
+                    label.append(1)
+                else:
+                    label.append(0)
+            label = np.array(label)
+
+            x_wav, x_mel, label = test_transform(file_path, label, CONFIG, DEVICE)
+            with torch.no_grad():
+                model.eval()
+                predict_ids, feature = model(x_wav, x_mel, label)
+
+                label = label.float()
+                loss = criterion(predict_ids, label.unsqueeze(0))
             
-            probs = - torch.log_softmax(preds, dim=1).mean(dim=0).squeeze().cpu().numpy()
-            y_pred[idx] = probs[label]
-            
-    auc = sklearn.metrics.roc_auc_score(label, y_pred)
-    p_auc = sklearn.metrics.roc_auc_score(label, y_pred, max_fpr=CONFIG["max_fpr"])
+            total_loss += loss.item()
+            probs = - torch.log_softmax(predict_ids, dim=1).mean(dim=0).squeeze().cpu().numpy()
+            label = label.cpu()
+            y_pred[file_idx] = probs[torch.argmax(label)]
+
+        if sum(np.isnan(np.array(y_true))) > 0:
+            y_true = np.nan_to_num(np.array(y_true))
+
+        if sum(np.isnan(np.array(y_pred))) > 0:
+            y_pred = np.nan_to_num(np.array(y_pred))
+        
+
+        auc = sklearn.metrics.roc_auc_score(y_true, y_pred)
+        p_auc = sklearn.metrics.roc_auc_score(y_true, y_pred, max_fpr=CONFIG["max_fpr"])
+        performance.append([auc, p_auc])
+
+    averaged_performance = np.mean(np.array(performance, dtype=float), axis=0)
+    mean_auc, mean_p_auc = averaged_performance[0], averaged_performance[1]
+    val_loss = total_loss / dataset_size
+
     
-      
-    print("loss: {:.6f} - ".format(val_loss / len(data_loader)), end="")
-    print(
-        "accuracy: {:.6f}% ({}/{})".format(
-            100 * float(correct / total), correct, total
-        ),
+
+    return val_loss, mean_auc, mean_p_auc
+
+
+
+class Generator(object):
+    def __init__(self, sr,
+                 n_fft=1024,
+                 n_mels=128,
+                 win_length=1024,
+                 hop_length=512,
+                 power=2.0
+                 ):
+        self.mel_transform = torchaudio.transforms.MelSpectrogram(sample_rate=sr,
+                                                                  win_length=win_length,
+                                                                  hop_length=hop_length,
+                                                                  n_fft=n_fft,
+                                                                  n_mels=n_mels,
+                                                                  power=power)
+        self.amplitude_to_db = torchaudio.transforms.AmplitudeToDB(stype='power')
+
+    def __call__(self, x):
+        # spec =  self.amplitude_to_db(self.mel_transform(x)).squeeze().transpose(-1,-2)
+        return self.amplitude_to_db(self.mel_transform(x))
+
+
+def test_transform(file_path, label, config, DEVICE):
+    label = torch.from_numpy(np.array(label)).long().to(DEVICE)
+    (x, _) = librosa.core.load(file_path, sr=config["feature"]["sr"], mono=True)
+
+    x_wav = x[None, None, :config["feature"]["sr"] * 10]  # (1, audio_length)
+    x_wav = torch.from_numpy(x_wav)
+    x_wav = x_wav.float().to(DEVICE)
+
+    x_mel = x[:config["feature"]["sr"] * 10]  # (1, audio_length)
+    x_mel = torch.from_numpy(x_mel)
+    x_mel = Generator(config["feature"]["sr"],
+                        n_fft=config["feature"]["n_fft"],
+                        n_mels=config["feature"]["n_mels"],
+                        win_length=config["feature"]["win_length"],
+                        hop_length=config["feature"]["hop_length"],
+                        power=config["feature"]["power"],
+                        )(x_mel).unsqueeze(0).unsqueeze(0).to(DEVICE)
+    return x_wav, x_mel, label
+
+def fit_gamma_dist(model, target_dir, machine_type, sec, sec_dict,CONFIG, DEVICE, mode):
+    """
+    - Calculate anomaly scores over sections.
+    - Fit gamma distribution for anomaly scores.
+    - Save the parameters of the distribution.
+    """
+
+    section_names = get_section_names(target_dir, dir_name="train")
+    dataset_scores = np.array([], dtype=np.float64)
+
+    # calculate anomaly scores over sections
+    for section_index, section_name in enumerate(section_names):
+        section_files, _ = file_list_generator(
+            target_dir=target_dir,
+            section_name=section_name,
+            dir_name="train",
+            mode=mode,
+        )
+        section_scores = [0.0 for k in section_files]
+        for file_idx, file_path in enumerate(section_files):
+            fp = os.path.split(file_path)[1]
+            fp = os.path.join(machine_type, "train", fp)
+            #label = sec.index(sec_dict[fp])
+            
+            label = []
+            for i in range(len(sec)):
+                if i == sec.index(sec_dict[fp]):
+                    label.append(1)
+                else:
+                    label.append(0)
+            label = np.array(label)
+
+            x_wav, x_mel, label = test_transform(file_path, label, CONFIG, DEVICE)
+            with torch.no_grad():
+                model.eval()
+                predict_ids, feature = model(x_wav, x_mel, label)
+
+            probs = - torch.log_softmax(predict_ids, dim=1).mean(dim=0).squeeze().cpu().numpy()
+            label = label.cpu()
+            section_scores[file_idx] = probs[torch.argmax(label)]
+
+            
+           
+
+        section_scores = np.array(section_scores)
+        dataset_scores = np.append(dataset_scores, section_scores)
+
+    dataset_scores = np.array(dataset_scores)
+
+    gamma_params = scipy.stats.gamma.fit(dataset_scores)
+    gamma_params = list(gamma_params)
+
+    # save the parameters of the distribution
+    score_file_path = "{model}/score_distr_{machine_type}.pkl".format(
+        model=CONFIG["model_directory"], machine_type=os.path.split(target_dir)[1]
     )
-    
-    print(auc, p_auc)
+    joblib.dump(gamma_params, score_file_path)
 
-def create_test_file_list(target_dir,
-                          id_name,
-                          dir_name='test',
-                          prefix_normal='normal',
-                          prefix_anomaly='anomaly',
-                          ext='wav'):
-    normal_files_path = f'{target_dir}/{dir_name}/{prefix_normal}_{id_name}*.{ext}'
-    normal_files = sorted(glob.glob(normal_files_path))
-    normal_labels = np.zeros(len(normal_files))
 
-    anomaly_files_path = f'{target_dir}/{dir_name}/{prefix_anomaly}_{id_name}*.{ext}'
-    anomaly_files = sorted(glob.glob(anomaly_files_path))
-    anomaly_labels = np.ones(len(anomaly_files))
+def save_csv(save_file_path,
+             save_data):
+    with open(save_file_path, "w", newline="") as f:
+        writer = csv.writer(f, lineterminator='\n')
+        writer.writerows(save_data)
 
-    files = np.concatenate((normal_files, anomaly_files), axis=0)
-    labels = np.concatenate((normal_labels, anomaly_labels), axis=0)
-    return files, labels
+
+def mixup_data(x_wav,x_spec, y, alpha=0.3, use_cuda=True):
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+
+    batch_size = x_wav.size()[0]
+    if use_cuda:
+        index = torch.randperm(batch_size).cuda()
+    else:
+        index = torch.randperm(batch_size)
+
+    mixed_x_wav = lam * x_wav + (1 - lam) * x_wav[index, :]
+    mixed_x_spec = lam * x_spec + (1 - lam) * x_spec[index, :]
+    y_a, y_b = y, y[index]
+    return mixed_x_wav, mixed_x_spec, y_a, y_b, lam
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
